@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../state/context";
-import { exportCsv, exportJson, exportXlsx, importCsvAsTransactions, importJsonFile } from "../lib/export";
+import { exportCsv, exportJson, importCsvAsTransactions, importJsonFile } from "../lib/export";
+import { exportRichXlsx } from "../lib/report";
 import {
   connect,
   disconnect,
@@ -261,16 +262,25 @@ export function Settings({ onLoadSample }: { onLoadSample: () => void }) {
           Сохраните таблицу всех транзакций в CSV или Excel, либо сделайте полную резервную копию (JSON).
         </p>
         <div className="flex flex-wrap gap-2">
-          <button className="btn-primary" onClick={() => exportCsv(data)}>
-            Скачать CSV
+          <button
+            className="btn-primary"
+            onClick={() => {
+              void exportRichXlsx(data);
+            }}
+          >
+            📊 Подробный отчёт (Excel)
           </button>
-          <button className="btn-primary" onClick={() => exportXlsx(data)}>
-            Скачать Excel
+          <button className="btn-secondary" onClick={() => exportCsv(data)}>
+            Скачать CSV
           </button>
           <button className="btn-secondary" onClick={() => exportJson(data)}>
             Резервная копия (JSON)
           </button>
         </div>
+        <p className="mt-2 text-xs text-slate-500">
+          Excel-отчёт — 9 листов: сводка, лист «Движения» с графиком (доход/расход/остаток), операции с разбивкой
+          по дням и категориям, помесячные обороты, рейтинг категорий, обороты по счетам, долги и цели.
+        </p>
       </div>
 
       <div className="card">
