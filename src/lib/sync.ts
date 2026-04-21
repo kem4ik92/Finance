@@ -8,12 +8,14 @@ import type {
 } from "../types";
 
 const SYNC_KEY = "finance-tracker-sync-v1";
+const WORKSPACES_KEY = "finance-tracker-workspaces-v1";
 
 export interface SyncConfig {
   apiBase: string;
   workspaceId: string;
   linkCode: string;
   connectedAt: string;
+  name?: string | null;
 }
 
 const DEFAULT_API_BASE = "https://manat-backend-txrnbhuq.fly.dev";
@@ -37,6 +39,7 @@ export function getSyncConfig(): SyncConfig | null {
 
 export function setSyncConfig(cfg: SyncConfig) {
   localStorage.setItem(SYNC_KEY, JSON.stringify(cfg));
+  upsertKnownWorkspace(cfg);
 }
 
 export function clearSyncConfig() {
@@ -45,6 +48,54 @@ export function clearSyncConfig() {
 
 export function isSynced(): boolean {
   return getSyncConfig() !== null;
+}
+
+// ---------- known workspaces registry ----------
+
+export function getKnownWorkspaces(): SyncConfig[] {
+  try {
+    const raw = localStorage.getItem(WORKSPACES_KEY);
+    if (!raw) {
+      const cur = getSyncConfig();
+      return cur ? [cur] : [];
+    }
+    const parsed = JSON.parse(raw) as SyncConfig[];
+    return Array.isArray(parsed) ? parsed.filter((w) => w?.workspaceId && w?.apiBase) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveKnownWorkspaces(list: SyncConfig[]) {
+  localStorage.setItem(WORKSPACES_KEY, JSON.stringify(list));
+}
+
+export function upsertKnownWorkspace(cfg: SyncConfig) {
+  const list = getKnownWorkspaces();
+  const idx = list.findIndex((w) => w.workspaceId === cfg.workspaceId);
+  if (idx >= 0) {
+    list[idx] = { ...list[idx], ...cfg };
+  } else {
+    list.push(cfg);
+  }
+  saveKnownWorkspaces(list);
+}
+
+export function removeKnownWorkspace(workspaceId: string) {
+  const list = getKnownWorkspaces().filter((w) => w.workspaceId !== workspaceId);
+  saveKnownWorkspaces(list);
+  const cur = getSyncConfig();
+  if (cur?.workspaceId === workspaceId) {
+    clearSyncConfig();
+    if (list.length > 0) setSyncConfig(list[0]);
+  }
+}
+
+export function switchWorkspace(workspaceId: string): SyncConfig | null {
+  const target = getKnownWorkspaces().find((w) => w.workspaceId === workspaceId);
+  if (!target) return null;
+  setSyncConfig({ ...target, connectedAt: new Date().toISOString() });
+  return target;
 }
 
 async function api<T>(
@@ -84,13 +135,13 @@ interface WorkspaceState {
 export async function resolveCode(
   code: string,
   apiBase: string = DEFAULT_API_BASE,
-): Promise<{ workspaceId: string; linkCode: string }> {
+): Promise<{ workspaceId: string; linkCode: string; name?: string | null }> {
   const clean = code.trim().toUpperCase();
   if (!clean) throw new Error("Введите код");
   const res = await fetch(`${apiBase}/api/workspaces/by-code/${clean}`);
   if (res.status === 404) throw new Error("Код не найден. Проверь /link в боте.");
   if (!res.ok) throw new Error(`Ошибка ${res.status}`);
-  return (await res.json()) as { workspaceId: string; linkCode: string };
+  return (await res.json()) as { workspaceId: string; linkCode: string; name?: string | null };
 }
 
 export async function pullState(): Promise<Partial<AppData> | null> {
@@ -112,13 +163,39 @@ export async function connect(
   code: string,
   apiBase: string = DEFAULT_API_BASE,
 ): Promise<void> {
-  const { workspaceId, linkCode } = await resolveCode(code, apiBase);
+  const { workspaceId, linkCode, name } = await resolveCode(code, apiBase);
   setSyncConfig({
     apiBase,
     workspaceId,
     linkCode,
+    name: name ?? null,
     connectedAt: new Date().toISOString(),
   });
+}
+
+export async function refreshWorkspaceMeta(workspaceId: string): Promise<void> {
+  try {
+    const cfg = getKnownWorkspaces().find((w) => w.workspaceId === workspaceId);
+    if (!cfg) return;
+    const res = await fetch(`${cfg.apiBase}/api/workspaces/${workspaceId}/meta`);
+    if (!res.ok) return;
+    const meta = (await res.json()) as { name?: string | null; linkCode?: string };
+    upsertKnownWorkspace({
+      ...cfg,
+      name: meta.name ?? null,
+      linkCode: meta.linkCode ?? cfg.linkCode,
+    });
+    const cur = getSyncConfig();
+    if (cur?.workspaceId === workspaceId) {
+      setSyncConfig({
+        ...cur,
+        name: meta.name ?? null,
+        linkCode: meta.linkCode ?? cur.linkCode,
+      });
+    }
+  } catch {
+    // ignore
+  }
 }
 
 export function disconnect() {

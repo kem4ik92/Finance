@@ -68,7 +68,16 @@ def resolve_code(code: str) -> dict[str, Any]:
         ws = session.query(Workspace).filter(Workspace.link_code == code.upper()).one_or_none()
         if ws is None:
             raise HTTPException(404, "code not found")
-        return {"workspaceId": ws.id, "linkCode": ws.link_code}
+        return {"workspaceId": ws.id, "linkCode": ws.link_code, "name": ws.name}
+
+
+@router.get("/workspaces/{workspace_id}/meta")
+def get_meta(workspace_id: str) -> dict[str, Any]:
+    with db_session() as session:
+        ws = session.get(Workspace, workspace_id)
+        if ws is None:
+            raise HTTPException(404, "workspace not found")
+        return {"workspaceId": ws.id, "linkCode": ws.link_code, "name": ws.name}
 
 
 @router.get("/workspaces/{workspace_id}/state")

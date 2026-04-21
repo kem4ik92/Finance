@@ -19,12 +19,15 @@ from .db import (
     Debt,
     Goal,
     Transaction,
+    User,
     Workspace,
+    WorkspaceMember,
     db_session,
     new_link_code,
     new_workspace_id,
     now_dt,
 )
+import secrets as _pysecrets
 from .defaults import seed_defaults
 
 log = logging.getLogger("bot")
@@ -40,7 +43,7 @@ MAIN_KEYBOARD: dict[str, Any] = {
         [{"text": "💳 Баланс"}, {"text": "📊 Отчёт"}],
         [{"text": "🏦 Долги"}, {"text": "🎯 Цели"}],
         [{"text": "💡 Советы"}, {"text": "🤖 AI"}],
-        [{"text": "🔗 Код"}],
+        [{"text": "👛 Кошельки"}, {"text": "🔗 Код"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -145,6 +148,7 @@ def set_webhook_sync(base_url: str) -> None:
                         {"command": "advice", "description": "Советы по экономии"},
                         {"command": "report", "description": "Отчёт за месяц"},
                         {"command": "ask", "description": "Спросить AI про финансы"},
+                        {"command": "wallets", "description": "Мои кошельки"},
                         {"command": "link", "description": "Код для сайта"},
                     ]
                 },
@@ -153,28 +157,131 @@ def set_webhook_sync(base_url: str) -> None:
         log.warning("setWebhook failed: %s", exc)
 
 
-# ---------- workspace + state ----------
+# ---------- user + workspace + state ----------
 
-def _ensure_workspace(session: Session, telegram_id: int, name: Optional[str]) -> Workspace:
-    ws = session.query(Workspace).filter(Workspace.telegram_id == telegram_id).one_or_none()
-    if ws is not None:
-        return ws
+def _new_user_id() -> str:
+    return _pysecrets.token_urlsafe(12)
+
+
+def _create_workspace(session: Session, owner: User, name: Optional[str]) -> Workspace:
     ws = Workspace(
         id=new_workspace_id(),
         link_code=new_link_code(),
-        telegram_id=telegram_id,
+        telegram_id=owner.telegram_id,
         created_at=now_dt(),
-        name=(name or "")[:128] or None,
+        name=(name or "").strip()[:128] or None,
     )
     session.add(ws)
     session.flush()
+    session.add(WorkspaceMember(workspace_id=ws.id, user_id=owner.id, role="owner"))
     seed_defaults(session, ws)
     session.flush()
     return ws
 
 
-def _get_state(ws: Workspace) -> dict[str, Any]:
-    raw = getattr(ws, "pending_state", None)
+def _ensure_user(session: Session, telegram_id: int, name: Optional[str]) -> User:
+    """Return the User for this telegram_id, migrating legacy data as needed.
+
+    On first contact: creates a User + a default personal Workspace ("Личный").
+    Legacy workspaces (created before multi-user) are attached as memberships.
+    """
+    user = session.query(User).filter(User.telegram_id == telegram_id).one_or_none()
+    if user is not None:
+        if name and user.name != name:
+            user.name = name[:128]
+        if user.current_workspace_id is None:
+            first = (
+                session.query(WorkspaceMember)
+                .filter(WorkspaceMember.user_id == user.id)
+                .first()
+            )
+            user.current_workspace_id = first.workspace_id if first else None
+        if user.current_workspace_id is None:
+            ws = _create_workspace(session, user, "Личный")
+            user.current_workspace_id = ws.id
+        return user
+
+    # Attach legacy workspace (pre-multi-user, linked by telegram_id only).
+    legacy_ws = (
+        session.query(Workspace)
+        .filter(Workspace.telegram_id == telegram_id)
+        .first()
+    )
+    user = User(
+        id=_new_user_id(),
+        telegram_id=telegram_id,
+        name=(name or None) and name[:128],
+        pending_state=legacy_ws.pending_state if legacy_ws is not None else None,
+    )
+    session.add(user)
+    session.flush()
+    if legacy_ws is not None:
+        session.add(
+            WorkspaceMember(workspace_id=legacy_ws.id, user_id=user.id, role="owner")
+        )
+        user.current_workspace_id = legacy_ws.id
+    else:
+        ws = _create_workspace(session, user, "Личный")
+        user.current_workspace_id = ws.id
+    session.flush()
+    return user
+
+
+def _current_ws(session: Session, user: User) -> Workspace:
+    """Return the user's current Workspace, repairing current_workspace_id if stale."""
+    ws: Optional[Workspace] = None
+    if user.current_workspace_id:
+        ws = session.get(Workspace, user.current_workspace_id)
+        if ws is not None:
+            is_member = (
+                session.query(WorkspaceMember)
+                .filter(
+                    WorkspaceMember.workspace_id == ws.id,
+                    WorkspaceMember.user_id == user.id,
+                )
+                .one_or_none()
+            )
+            if is_member is None:
+                ws = None
+    if ws is None:
+        membership = (
+            session.query(WorkspaceMember)
+            .filter(WorkspaceMember.user_id == user.id)
+            .first()
+        )
+        if membership is not None:
+            ws = session.get(Workspace, membership.workspace_id)
+    if ws is None:
+        ws = _create_workspace(session, user, "Личный")
+    user.current_workspace_id = ws.id
+    return ws
+
+
+def _user_workspaces(session: Session, user: User) -> list[Workspace]:
+    rows = (
+        session.query(WorkspaceMember, Workspace)
+        .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+        .filter(WorkspaceMember.user_id == user.id)
+        .order_by(WorkspaceMember.joined_at.asc())
+        .all()
+    )
+    return [ws for _, ws in rows]
+
+
+def _is_owner(session: Session, user: User, ws: Workspace) -> bool:
+    m = (
+        session.query(WorkspaceMember)
+        .filter(
+            WorkspaceMember.workspace_id == ws.id,
+            WorkspaceMember.user_id == user.id,
+        )
+        .one_or_none()
+    )
+    return bool(m and m.role == "owner")
+
+
+def _get_state(user: User) -> dict[str, Any]:
+    raw = getattr(user, "pending_state", None)
     if not raw:
         return {}
     try:
@@ -183,8 +290,8 @@ def _get_state(ws: Workspace) -> dict[str, Any]:
         return {}
 
 
-def _set_state(ws: Workspace, state: Optional[dict[str, Any]]) -> None:
-    ws.pending_state = json.dumps(state) if state else None
+def _set_state(user: User, state: Optional[dict[str, Any]]) -> None:
+    user.pending_state = json.dumps(state) if state else None
 
 
 def _default_account(session: Session, ws: Workspace) -> Optional[Account]:
@@ -445,7 +552,7 @@ AI_SUGGESTIONS = [
 ]
 
 
-async def start_ai_flow(chat_id: int, ws: Workspace) -> None:
+async def start_ai_flow(chat_id: int, user: User) -> None:
     if not ai_available():
         await send_message(
             chat_id,
@@ -453,7 +560,7 @@ async def start_ai_flow(chat_id: int, ws: Workspace) -> None:
             reply_markup=MAIN_KEYBOARD,
         )
         return
-    _set_state(ws, {"flow": "ask_question"})
+    _set_state(user, {"flow": "ask_question"})
     ideas = "\n".join(f"— {s}" for s in AI_SUGGESTIONS)
     await send_message(
         chat_id,
@@ -496,6 +603,57 @@ async def run_ai_question(chat_id: int, ws: Workspace, question: str) -> None:
     if len(answer) > MAX:
         answer = answer[:MAX] + "…"
     await send_message(chat_id, f"🤖 {answer}", reply_markup=MAIN_KEYBOARD)
+
+
+async def show_wallets(chat_id: int, user: User, session: Session) -> None:
+    """Render the list of the user's wallets with inline management buttons."""
+    current_id = user.current_workspace_id
+    wallets = _user_workspaces(session, user)
+
+    lines = ["<b>👛 Твои кошельки</b>\n"]
+    rows: list[list[dict[str, Any]]] = []
+    for w in wallets:
+        is_current = w.id == current_id
+        owner = _is_owner(session, user, w)
+        role_mark = " ⭐" if owner else ""
+        marker = "✅ " if is_current else "• "
+        name = w.name or "Без имени"
+        lines.append(f"{marker}<b>{name}</b>{role_mark} — код <code>{w.link_code}</code>")
+        label_switch = f"{'✓ ' if is_current else ''}Выбрать «{name[:20]}»"
+        rows.append([
+            {"text": label_switch[:64], "callback_data": f"wspick:{w.id}"},
+        ])
+        admin_row: list[dict[str, Any]] = [
+            {"text": "📤 Пригласить", "callback_data": f"wsinvite:{w.id}"},
+        ]
+        if owner:
+            admin_row.append({"text": "✏ Переименовать", "callback_data": f"wsrename:{w.id}"})
+        rows.append(admin_row)
+        leave_row: list[dict[str, Any]] = []
+        if owner and len(wallets) > 1:
+            leave_row.append({"text": "🗑 Удалить", "callback_data": f"wsdel:{w.id}"})
+        elif not owner:
+            leave_row.append({"text": "🚪 Выйти", "callback_data": f"wsleave:{w.id}"})
+        if leave_row:
+            rows.append(leave_row)
+        rows.append([{"text": "─────────", "callback_data": "noop"}])
+
+    rows.append([
+        {"text": "➕ Создать новый", "callback_data": "wsnew"},
+        {"text": "🔗 Подключиться по коду", "callback_data": "wsjoin"},
+    ])
+
+    lines.append(
+        "\n<i>⭐ — твой кошелёк (ты владелец). "
+        "Код рядом с кошельком можно дать другому человеку — он напишет боту /start и "
+        "нажмёт «Подключиться по коду», чтобы вести этот кошелёк вместе с тобой. "
+        "Его же можно вставить в Настройки на сайте.</i>"
+    )
+    await send_message(
+        chat_id,
+        "\n".join(lines),
+        reply_markup={"inline_keyboard": rows},
+    )
 
 
 async def show_link(chat_id: int, ws: Workspace) -> None:
@@ -618,7 +776,7 @@ async def handle_debt_add_command(chat_id: int, ws: Workspace, rest: str) -> Non
         await send_message(chat_id, "Сумма должна быть положительной.")
         return
     with db_session() as session:
-        ws = _ensure_workspace(session, ws.telegram_id or 0, None)
+        ws = session.get(Workspace, ws.id) or ws
         d = Debt(
             id=str(uuid.uuid4()),
             workspace_id=ws.id,
@@ -746,6 +904,7 @@ async def _apply_goal_contribution(
 
 async def handle_state_text(
     chat_id: int,
+    user: User,
     ws: Workspace,
     session: Session,
     state: dict[str, Any],
@@ -767,13 +926,13 @@ async def handle_state_text(
             account = _default_account(session, ws)
             if account is None:
                 await send_message(chat_id, "Нет счетов. Нажми /start.")
-                _set_state(ws, None)
+                _set_state(user, None)
                 return True
             total = _create_tx(
                 session, ws, type_=type_, amount=amount,
                 account_id=account.id, category_id=None,
             )
-            _set_state(ws, None)
+            _set_state(user, None)
             sign = "+" if type_ == "income" else "−"
             await send_message(
                 chat_id,
@@ -782,7 +941,7 @@ async def handle_state_text(
             )
             return True
         prefix = "exp" if type_ == "expense" else "inc"
-        _set_state(ws, {"flow": f"{flow}_cat", "amount": amount, "type": type_})
+        _set_state(user, {"flow": f"{flow}_cat", "amount": amount, "type": type_})
         header = "🧾 <b>Расход</b>" if type_ == "expense" else "💼 <b>Доход</b>"
         await send_message(
             chat_id,
@@ -797,13 +956,13 @@ async def handle_state_text(
         target = session.query(Debt).filter(Debt.id == debt_id, Debt.workspace_id == ws.id).one_or_none()
         if target is None:
             await send_message(chat_id, "Этот долг больше не существует.", reply_markup=MAIN_KEYBOARD)
-            _set_state(ws, None)
+            _set_state(user, None)
             return True
         amount = _parse_amount(text.split()[0]) if text else None
         if amount is None:
             await send_message(chat_id, "Нужна сумма числом. Пример: 500")
             return True
-        _set_state(ws, None)
+        _set_state(user, None)
         await _apply_debt_payment(chat_id, ws, session, target, amount)
         return True
 
@@ -813,13 +972,13 @@ async def handle_state_text(
         target = session.query(Goal).filter(Goal.id == goal_id, Goal.workspace_id == ws.id).one_or_none()
         if target is None:
             await send_message(chat_id, "Эта цель больше не существует.", reply_markup=MAIN_KEYBOARD)
-            _set_state(ws, None)
+            _set_state(user, None)
             return True
         amount = _parse_amount(text.split()[0]) if text else None
         if amount is None:
             await send_message(chat_id, "Нужна сумма числом. Пример: 500")
             return True
-        _set_state(ws, None)
+        _set_state(user, None)
         await _apply_goal_contribution(chat_id, ws, session, target, amount)
         return True
 
@@ -846,7 +1005,7 @@ async def handle_state_text(
             created_at=now_dt(),
         )
         session.add(d)
-        _set_state(ws, None)
+        _set_state(user, None)
         await send_message(
             chat_id,
             f"💳 Добавил долг <b>{name.strip()}</b> на <b>{_ru(amount)}</b>.",
@@ -876,7 +1035,7 @@ async def handle_state_text(
             created_at=now_dt(),
         )
         session.add(g)
-        _set_state(ws, None)
+        _set_state(user, None)
         await send_message(
             chat_id,
             f"🎯 Добавил цель <b>{name}</b> на <b>{_ru(amount)}</b>.",
@@ -886,8 +1045,79 @@ async def handle_state_text(
 
     # 6) AI question
     if flow == "ask_question":
-        _set_state(ws, None)
+        _set_state(user, None)
         await run_ai_question(chat_id, ws, text)
+        return True
+
+    # 7) workspace management flows
+    if flow == "new_workspace":
+        _set_state(user, None)
+        name = text.strip()[:128]
+        if not name:
+            await send_message(chat_id, "Пустое имя. Давай ещё раз.")
+            return True
+        new_ws = _create_workspace(session, user, name)
+        user.current_workspace_id = new_ws.id
+        await send_message(
+            chat_id,
+            f"👛 Создал кошелёк <b>{name}</b> и сделал его текущим.\nКод для синхронизации/приглашения: <code>{new_ws.link_code}</code>",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await show_wallets(chat_id, user, session)
+        return True
+
+    if flow == "rename_workspace":
+        target_id = state.get("workspace_id")
+        _set_state(user, None)
+        if not target_id:
+            return True
+        target_ws = session.get(Workspace, target_id)
+        if target_ws is None or not _is_owner(session, user, target_ws):
+            await send_message(chat_id, "Не могу переименовать этот кошелёк.", reply_markup=MAIN_KEYBOARD)
+            return True
+        name = text.strip()[:128]
+        if not name:
+            await send_message(chat_id, "Пустое имя. Давай ещё раз.")
+            return True
+        target_ws.name = name
+        await send_message(
+            chat_id,
+            f"✏ Переименовал в <b>{name}</b>.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await show_wallets(chat_id, user, session)
+        return True
+
+    if flow == "join_workspace":
+        _set_state(user, None)
+        code = text.strip().upper()
+        code = re.sub(r"[^A-Z0-9]", "", code)[:16]
+        if len(code) != 6:
+            await send_message(chat_id, "Код — это 6 символов (буквы/цифры). Пример: <code>KKVRJD</code>")
+            return True
+        target_ws = session.query(Workspace).filter(Workspace.link_code == code).one_or_none()
+        if target_ws is None:
+            await send_message(chat_id, "Не нашёл кошелёк по этому коду.", reply_markup=MAIN_KEYBOARD)
+            return True
+        existing = (
+            session.query(WorkspaceMember)
+            .filter(
+                WorkspaceMember.workspace_id == target_ws.id,
+                WorkspaceMember.user_id == user.id,
+            )
+            .one_or_none()
+        )
+        if existing is None:
+            session.add(
+                WorkspaceMember(workspace_id=target_ws.id, user_id=user.id, role="member")
+            )
+        user.current_workspace_id = target_ws.id
+        await send_message(
+            chat_id,
+            f"✅ Подключил тебя к кошельку <b>{target_ws.name or 'Без имени'}</b> и сделал его текущим.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await show_wallets(chat_id, user, session)
         return True
 
     return False
@@ -906,6 +1136,7 @@ MENU_BUTTONS = {
     "🎯 Цели": "menu_goals",
     "💡 Советы": "menu_advice",
     "🤖 AI": "menu_ai",
+    "👛 Кошельки": "menu_wallets",
     "🔗 Код": "menu_link",
 }
 
@@ -928,18 +1159,19 @@ async def dispatch_update(update: dict[str, Any]) -> None:
 
     try:
         with db_session() as session:
-            ws = _ensure_workspace(session, user_id, user_name)
-            state = _get_state(ws)
+            user = _ensure_user(session, user_id, user_name)
+            ws = _current_ws(session, user)
+            state = _get_state(user)
 
             # Menu buttons
             if text in MENU_BUTTONS:
-                _set_state(ws, None)
+                _set_state(user, None)
                 action = MENU_BUTTONS[text]
                 if action == "menu_expense":
-                    _set_state(ws, {"flow": "expense_amount"})
+                    _set_state(user, {"flow": "expense_amount"})
                     await send_message(chat_id, "Сколько потратил? Напиши число. Пример: 350")
                 elif action == "menu_income":
-                    _set_state(ws, {"flow": "income_amount"})
+                    _set_state(user, {"flow": "income_amount"})
                     await send_message(chat_id, "Сколько получил? Напиши число. Пример: 5000")
                 elif action == "menu_balance":
                     await show_balance(chat_id, ws)
@@ -952,13 +1184,15 @@ async def dispatch_update(update: dict[str, Any]) -> None:
                 elif action == "menu_advice":
                     await show_advice(chat_id, ws)
                 elif action == "menu_ai":
-                    await start_ai_flow(chat_id, ws)
+                    await start_ai_flow(chat_id, user)
+                elif action == "menu_wallets":
+                    await show_wallets(chat_id, user, session)
                 elif action == "menu_link":
                     await show_link(chat_id, ws)
                 return
 
             # Active state
-            if state and await handle_state_text(chat_id, ws, session, state, text):
+            if state and await handle_state_text(chat_id, user, ws, session, state, text):
                 return
 
             # Slash commands
@@ -981,6 +1215,8 @@ async def dispatch_update(update: dict[str, Any]) -> None:
                 await show_start(chat_id, ws)
             elif cmd == "link":
                 await show_link(chat_id, ws)
+            elif cmd in ("wallets", "wallet"):
+                await show_wallets(chat_id, user, session)
             elif cmd == "add":
                 await handle_add_command(chat_id, ws, session, rest, "expense")
             elif cmd == "income":
@@ -1003,9 +1239,9 @@ async def dispatch_update(update: dict[str, Any]) -> None:
                 if rest:
                     await run_ai_question(chat_id, ws, rest)
                 else:
-                    await start_ai_flow(chat_id, ws)
+                    await start_ai_flow(chat_id, user)
             elif cmd == "cancel":
-                _set_state(ws, None)
+                _set_state(user, None)
                 await send_message(chat_id, "Отменил.", reply_markup=MAIN_KEYBOARD)
             else:
                 await send_message(
@@ -1037,10 +1273,11 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
 
     try:
         with db_session() as session:
-            ws = _ensure_workspace(session, user_id, user_name)
+            user = _ensure_user(session, user_id, user_name)
+            ws = _current_ws(session, user)
 
             if data == "cancel":
-                _set_state(ws, None)
+                _set_state(user, None)
                 await answer_callback(cb_id, "Отменено")
                 if message_id:
                     try:
@@ -1054,7 +1291,7 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 return
 
             if data.startswith("exp:") or data.startswith("inc:"):
-                state = _get_state(ws)
+                state = _get_state(user)
                 if state.get("flow") not in ("expense_amount_cat", "income_amount_cat"):
                     await answer_callback(cb_id, "Нажми «💸 Расход» или «💰 Доход» сначала.", alert=True)
                     return
@@ -1067,13 +1304,13 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 account = _default_account(session, ws)
                 if amount <= 0 or account is None or cat is None:
                     await answer_callback(cb_id, "Не удалось сохранить.", alert=True)
-                    _set_state(ws, None)
+                    _set_state(user, None)
                     return
                 total = _create_tx(
                     session, ws, type_=type_, amount=amount,
                     account_id=account.id, category_id=cat.id,
                 )
-                _set_state(ws, None)
+                _set_state(user, None)
                 sign = "+" if type_ == "income" else "−"
                 ico = "💼" if type_ == "income" else "🧾"
                 text = (
@@ -1100,7 +1337,7 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 if not debt:
                     await answer_callback(cb_id, "Долг не найден.", alert=True)
                     return
-                _set_state(ws, {"flow": "pay_amount", "debt_id": debt.id})
+                _set_state(user, {"flow": "pay_amount", "debt_id": debt.id})
                 await answer_callback(cb_id)
                 remaining = max(0.0, debt.total_amount - debt.paid_amount)
                 await send_message(
@@ -1117,7 +1354,7 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 if not goal:
                     await answer_callback(cb_id, "Цель не найдена.", alert=True)
                     return
-                _set_state(ws, {"flow": "goal_amount", "goal_id": goal.id})
+                _set_state(user, {"flow": "goal_amount", "goal_id": goal.id})
                 await answer_callback(cb_id)
                 remaining = max(0.0, goal.target_amount - goal.saved_amount)
                 await send_message(
@@ -1189,7 +1426,7 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 return
 
             if data == "newdebt":
-                _set_state(ws, {"flow": "new_debt"})
+                _set_state(user, {"flow": "new_debt"})
                 await answer_callback(cb_id)
                 await send_message(
                     chat_id,
@@ -1198,12 +1435,195 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                 return
 
             if data == "newgoal":
-                _set_state(ws, {"flow": "new_goal"})
+                _set_state(user, {"flow": "new_goal"})
                 await answer_callback(cb_id)
                 await send_message(
                     chat_id,
                     "Напиши: <b>Название Сумма</b>\nПример: <code>Ноутбук 10000</code>",
                 )
+                return
+
+            # ---------- wallet management ----------
+            if data == "noop":
+                await answer_callback(cb_id)
+                return
+
+            if data == "wsnew":
+                _set_state(user, {"flow": "new_workspace"})
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    "Как назвать новый кошелёк? Напиши одно слово или фразу.\nПример: <code>Бизнес</code> или <code>Семейный</code>.",
+                )
+                return
+
+            if data == "wsjoin":
+                _set_state(user, {"flow": "join_workspace"})
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    "Напиши 6-значный код кошелька, к которому хочешь подключиться.\nКод можно получить у владельца кошелька — в его боте «👛 Кошельки» → «📤 Пригласить».",
+                )
+                return
+
+            if data.startswith("wspick:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                member = (
+                    session.query(WorkspaceMember)
+                    .filter(
+                        WorkspaceMember.workspace_id == target_id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                    .one_or_none()
+                )
+                if target_ws is None or member is None:
+                    await answer_callback(cb_id, "Этот кошелёк недоступен.", alert=True)
+                    return
+                user.current_workspace_id = target_ws.id
+                _set_state(user, None)
+                await answer_callback(cb_id, f"Выбран: {target_ws.name or 'Без имени'}")
+                await show_wallets(chat_id, user, session)
+                return
+
+            if data.startswith("wsinvite:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                member = (
+                    session.query(WorkspaceMember)
+                    .filter(
+                        WorkspaceMember.workspace_id == target_id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                    .one_or_none()
+                )
+                if target_ws is None or member is None:
+                    await answer_callback(cb_id, "Этот кошелёк недоступен.", alert=True)
+                    return
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    (
+                        f"📤 <b>Приглашение в «{target_ws.name or 'Без имени'}»</b>\n\n"
+                        f"Код: <code>{target_ws.link_code}</code>\n\n"
+                        "Передай этот код тому, кого хочешь пригласить. Ему нужно:\n"
+                        "• в боте @finance_kema_bot написать /start, нажать «👛 Кошельки» → «🔗 Подключиться по коду» и ввести этот код;\n"
+                        f"• или на сайте {WEB_URL} в Настройках вставить этот код."
+                    ),
+                )
+                return
+
+            if data.startswith("wsrename:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None or not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец может переименовать.", alert=True)
+                    return
+                _set_state(user, {"flow": "rename_workspace", "workspace_id": target_id})
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    f"Как переименовать «{target_ws.name or 'Без имени'}»? Напиши новое название.",
+                )
+                return
+
+            if data.startswith("wsleave:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                member = (
+                    session.query(WorkspaceMember)
+                    .filter(
+                        WorkspaceMember.workspace_id == target_id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                    .one_or_none()
+                )
+                if target_ws is None or member is None:
+                    await answer_callback(cb_id, "Ты не состоишь в этом кошельке.", alert=True)
+                    return
+                if member.role == "owner":
+                    await answer_callback(cb_id, "Владелец не может выйти — используй «Удалить».", alert=True)
+                    return
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    f"Выйти из кошелька «<b>{target_ws.name or 'Без имени'}</b>»? Операции в нём останутся, но ты перестанешь его видеть.",
+                    reply_markup=_confirm_keyboard(f"confwsleave:{target_id}"),
+                )
+                return
+
+            if data.startswith("confwsleave:"):
+                target_id = data.split(":", 1)[1]
+                member = (
+                    session.query(WorkspaceMember)
+                    .filter(
+                        WorkspaceMember.workspace_id == target_id,
+                        WorkspaceMember.user_id == user.id,
+                    )
+                    .one_or_none()
+                )
+                if member is None:
+                    await answer_callback(cb_id, "Уже не состоишь.", alert=True)
+                    return
+                if member.role == "owner":
+                    await answer_callback(cb_id, "Владелец не может выйти.", alert=True)
+                    return
+                session.delete(member)
+                if user.current_workspace_id == target_id:
+                    user.current_workspace_id = None
+                session.flush()
+                _current_ws(session, user)  # reassign fallback
+                await answer_callback(cb_id, "Вышел из кошелька")
+                if message_id:
+                    try:
+                        await edit_message_text(chat_id, message_id, "🚪 Вышел из кошелька.")
+                    except Exception:
+                        pass
+                await show_wallets(chat_id, user, session)
+                return
+
+            if data.startswith("wsdel:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None or not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец может удалять.", alert=True)
+                    return
+                wallets = _user_workspaces(session, user)
+                if len(wallets) <= 1:
+                    await answer_callback(cb_id, "Нельзя удалить единственный кошелёк — сначала создай ещё один.", alert=True)
+                    return
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    (
+                        f"Удалить кошелёк «<b>{target_ws.name or 'Без имени'}</b>»?\n"
+                        "Это удалит все счета, операции, долги и цели внутри него для всех участников. Это не отменить."
+                    ),
+                    reply_markup=_confirm_keyboard(f"confwsdel:{target_id}"),
+                )
+                return
+
+            if data.startswith("confwsdel:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None:
+                    await answer_callback(cb_id, "Уже удалён.", alert=True)
+                    return
+                if not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец может удалять.", alert=True)
+                    return
+                session.delete(target_ws)
+                if user.current_workspace_id == target_id:
+                    user.current_workspace_id = None
+                session.flush()
+                _current_ws(session, user)
+                await answer_callback(cb_id, "Кошелёк удалён")
+                if message_id:
+                    try:
+                        await edit_message_text(chat_id, message_id, "🗑 Кошелёк удалён.")
+                    except Exception:
+                        pass
+                await show_wallets(chat_id, user, session)
                 return
 
             await answer_callback(cb_id)

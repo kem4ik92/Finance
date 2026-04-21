@@ -49,9 +49,12 @@ class Workspace(Base):
     __tablename__ = "workspaces"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     link_code: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    # Legacy single-owner link. New code relies on WorkspaceMember.
     telegram_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_dt)
     name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Legacy per-workspace FSM state. Kept for backward compatibility; new code
+    # stores conversational state on the User.
     pending_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     accounts: Mapped[list["Account"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
@@ -59,6 +62,40 @@ class Workspace(Base):
     transactions: Mapped[list["Transaction"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
     debts: Mapped[list["Debt"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
     goals: Mapped[list["Goal"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    members: Mapped[list["WorkspaceMember"]] = relationship(
+        back_populates="workspace", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    current_workspace_id: Mapped[Optional[str]] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True
+    )
+    pending_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_dt)
+
+    memberships: Mapped[list["WorkspaceMember"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+    workspace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(16), default="member")  # owner|member
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=now_dt)
+
+    workspace: Mapped["Workspace"] = relationship(back_populates="members")
+    user: Mapped["User"] = relationship(back_populates="memberships")
 
 
 class Account(Base):
@@ -139,6 +176,43 @@ def init_db() -> None:
         cols = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(workspaces)").fetchall()}
         if "pending_state" not in cols:
             conn.exec_driver_sql("ALTER TABLE workspaces ADD COLUMN pending_state TEXT")
+
+    # Backfill User + WorkspaceMember from legacy Workspace.telegram_id so the
+    # multi-wallet / multi-user model works for pre-existing data.
+    with SessionLocal() as session:
+        legacy = session.query(Workspace).filter(Workspace.telegram_id.isnot(None)).all()
+        for ws in legacy:
+            if ws.telegram_id is None:
+                continue
+            user = session.query(User).filter(User.telegram_id == ws.telegram_id).one_or_none()
+            if user is None:
+                user = User(
+                    id=secrets.token_urlsafe(12),
+                    telegram_id=ws.telegram_id,
+                    name=ws.name,
+                    current_workspace_id=ws.id,
+                    pending_state=ws.pending_state,
+                )
+                session.add(user)
+                session.flush()
+            else:
+                if user.current_workspace_id is None:
+                    user.current_workspace_id = ws.id
+                if user.pending_state is None and ws.pending_state is not None:
+                    user.pending_state = ws.pending_state
+            exists = (
+                session.query(WorkspaceMember)
+                .filter(
+                    WorkspaceMember.workspace_id == ws.id,
+                    WorkspaceMember.user_id == user.id,
+                )
+                .one_or_none()
+            )
+            if exists is None:
+                session.add(
+                    WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="owner")
+                )
+        session.commit()
 
 
 @contextmanager
