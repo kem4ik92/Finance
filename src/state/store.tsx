@@ -212,20 +212,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-pull when window regains focus (pick up bot changes).
+  // Re-pull on focus, visibility change, and poll while the tab is visible
+  // so that changes made via the Telegram bot show up without a manual refresh.
   useEffect(() => {
-    function onFocus() {
-      if (!isSynced()) return;
-      pullState()
-        .then((remote) => {
-          if (remote) {
-            dispatch({ type: "replace", data: { ...data, ...remote } });
-          }
-        })
-        .catch((err) => console.warn("[sync] refresh failed:", err));
+    let cancelled = false;
+    let inFlight = false;
+
+    async function refresh() {
+      if (!isSynced() || inFlight || document.hidden) return;
+      inFlight = true;
+      try {
+        const remote = await pullState();
+        if (!cancelled && remote) {
+          dispatch({ type: "replace", data: { ...data, ...remote } });
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn("[sync] refresh failed:", err);
+      } finally {
+        inFlight = false;
+      }
     }
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    const timer = window.setInterval(refresh, 20000);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+      window.clearInterval(timer);
+    };
   }, [data]);
 
   const value: StoreContextValue = useMemo(
