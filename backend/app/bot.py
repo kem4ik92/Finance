@@ -12,6 +12,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from .advice import compute_advice
+from .ai import ai_available, answer_question
 from .db import (
     Account,
     Category,
@@ -38,7 +39,8 @@ MAIN_KEYBOARD: dict[str, Any] = {
         [{"text": "💸 Расход"}, {"text": "💰 Доход"}],
         [{"text": "💳 Баланс"}, {"text": "📊 Отчёт"}],
         [{"text": "🏦 Долги"}, {"text": "🎯 Цели"}],
-        [{"text": "💡 Советы"}, {"text": "🔗 Код"}],
+        [{"text": "💡 Советы"}, {"text": "🤖 AI"}],
+        [{"text": "🔗 Код"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -142,6 +144,7 @@ def set_webhook_sync(base_url: str) -> None:
                         {"command": "goals", "description": "Цели"},
                         {"command": "advice", "description": "Советы по экономии"},
                         {"command": "report", "description": "Отчёт за месяц"},
+                        {"command": "ask", "description": "Спросить AI про финансы"},
                         {"command": "link", "description": "Код для сайта"},
                     ]
                 },
@@ -432,6 +435,67 @@ async def show_report(chat_id: int, ws: Workspace) -> None:
         for name, amount in sorted(by_cat.items(), key=lambda kv: kv[1], reverse=True)[:8]:
             lines.append(f"• {name}: {_ru(amount)}")
     await send_message(chat_id, "\n".join(lines))
+
+
+AI_SUGGESTIONS = [
+    "Сколько я трачу на еду в среднем?",
+    "Какой долг лучше закрыть первым?",
+    "На чём реально сэкономить?",
+    "Когда я накоплю на свою цель текущим темпом?",
+]
+
+
+async def start_ai_flow(chat_id: int, ws: Workspace) -> None:
+    if not ai_available():
+        await send_message(
+            chat_id,
+            "AI не подключён (нет ключа OPENROUTER_API_KEY на сервере).",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    _set_state(ws, {"flow": "ask_question"})
+    ideas = "\n".join(f"— {s}" for s in AI_SUGGESTIONS)
+    await send_message(
+        chat_id,
+        (
+            "🤖 <b>AI-ассистент</b>\n"
+            "Задай любой вопрос про свои финансы. Я знаю твои счета, последние операции, долги и цели.\n\n"
+            f"Примеры:\n{ideas}\n\n"
+            "Напиши вопрос одним сообщением."
+        ),
+    )
+
+
+async def run_ai_question(chat_id: int, ws: Workspace, question: str) -> None:
+    question = question.strip()
+    if not question:
+        await send_message(chat_id, "Пустой вопрос. Попробуй ещё раз.")
+        return
+    if len(question) > 1000:
+        await send_message(chat_id, "Слишком длинный вопрос (больше 1000 символов). Сократи.")
+        return
+    try:
+        await _tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    except Exception:
+        pass
+    try:
+        answer = await answer_question(ws, question)
+    except RuntimeError as exc:
+        await send_message(chat_id, f"🤖 {exc}", reply_markup=MAIN_KEYBOARD)
+        return
+    except Exception:
+        log.exception("ai answer failed")
+        await send_message(
+            chat_id,
+            "🤖 Не получилось спросить AI. Попробуй позже.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    # Trim overly long answers
+    MAX = 3800
+    if len(answer) > MAX:
+        answer = answer[:MAX] + "…"
+    await send_message(chat_id, f"🤖 {answer}", reply_markup=MAIN_KEYBOARD)
 
 
 async def show_link(chat_id: int, ws: Workspace) -> None:
@@ -820,6 +884,12 @@ async def handle_state_text(
         )
         return True
 
+    # 6) AI question
+    if flow == "ask_question":
+        _set_state(ws, None)
+        await run_ai_question(chat_id, ws, text)
+        return True
+
     return False
 
 
@@ -835,6 +905,7 @@ MENU_BUTTONS = {
     "🏦 Долги": "menu_debts",
     "🎯 Цели": "menu_goals",
     "💡 Советы": "menu_advice",
+    "🤖 AI": "menu_ai",
     "🔗 Код": "menu_link",
 }
 
@@ -880,6 +951,8 @@ async def dispatch_update(update: dict[str, Any]) -> None:
                     await show_goals(chat_id, ws)
                 elif action == "menu_advice":
                     await show_advice(chat_id, ws)
+                elif action == "menu_ai":
+                    await start_ai_flow(chat_id, ws)
                 elif action == "menu_link":
                     await show_link(chat_id, ws)
                 return
@@ -926,6 +999,11 @@ async def dispatch_update(update: dict[str, Any]) -> None:
                 await show_advice(chat_id, ws)
             elif cmd == "report":
                 await show_report(chat_id, ws)
+            elif cmd == "ask":
+                if rest:
+                    await run_ai_question(chat_id, ws, rest)
+                else:
+                    await start_ai_flow(chat_id, ws)
             elif cmd == "cancel":
                 _set_state(ws, None)
                 await send_message(chat_id, "Отменил.", reply_markup=MAIN_KEYBOARD)
