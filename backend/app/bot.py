@@ -618,7 +618,8 @@ async def show_wallets(chat_id: int, user: User, session: Session) -> None:
         role_mark = " ⭐" if owner else ""
         marker = "✅ " if is_current else "• "
         name = w.name or "Без имени"
-        lines.append(f"{marker}<b>{name}</b>{role_mark} — код <code>{w.link_code}</code>")
+        lock = " 🔒" if w.pin_hash is not None else ""
+        lines.append(f"{marker}<b>{name}</b>{role_mark}{lock} — код <code>{w.link_code}</code>")
         label_switch = f"{'✓ ' if is_current else ''}Выбрать «{name[:20]}»"
         rows.append([
             {"text": label_switch[:64], "callback_data": f"wspick:{w.id}"},
@@ -629,6 +630,15 @@ async def show_wallets(chat_id: int, user: User, session: Session) -> None:
         if owner:
             admin_row.append({"text": "✏ Переименовать", "callback_data": f"wsrename:{w.id}"})
         rows.append(admin_row)
+        if owner:
+            pin_label = "🔒 Сменить код-пароль" if w.pin_hash is not None else "🔒 Поставить код-пароль сайта"
+            rows.append([
+                {"text": pin_label, "callback_data": f"wspin:{w.id}"},
+            ])
+            if w.pin_hash is not None:
+                rows.append([
+                    {"text": "❌ Снять код-пароль", "callback_data": f"wspinoff:{w.id}"},
+                ])
         leave_row: list[dict[str, Any]] = []
         if owner and len(wallets) > 1:
             leave_row.append({"text": "🗑 Удалить", "callback_data": f"wsdel:{w.id}"})
@@ -1088,6 +1098,37 @@ async def handle_state_text(
         await show_wallets(chat_id, user, session)
         return True
 
+    if flow == "set_pin":
+        target_id = state.get("workspace_id")
+        _set_state(user, None)
+        if not target_id:
+            return True
+        target_ws = session.get(Workspace, target_id)
+        if target_ws is None or not _is_owner(session, user, target_ws):
+            await send_message(chat_id, "Не могу поменять код-пароль.", reply_markup=MAIN_KEYBOARD)
+            return True
+        pin = re.sub(r"\s+", "", text.strip())
+        if len(pin) < 4 or len(pin) > 32:
+            await send_message(chat_id, "Код-пароль должен быть от 4 до 32 символов. Попробуй ещё раз.", reply_markup=MAIN_KEYBOARD)
+            return True
+        from .api import set_workspace_pin as _set_pin
+
+        _set_pin(session, target_ws, pin)
+        session.flush()
+        await send_message(
+            chat_id,
+            (
+                f"🔒 Поставил код-пароль на «<b>{target_ws.name or 'Без имени'}</b>».\n\n"
+                "Теперь на сайте, чтобы открыть этот кошелёк, нужно ввести:\n"
+                f"1) 6-значный код синхронизации <code>{target_ws.link_code}</code>\n"
+                "2) код-пароль, который ты только что задал.\n\n"
+                "Все активные сессии на сайте разлогинены — подключись заново со своего устройства."
+            ),
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await show_wallets(chat_id, user, session)
+        return True
+
     if flow == "join_workspace":
         _set_state(user, None)
         code = text.strip().upper()
@@ -1525,6 +1566,63 @@ async def _dispatch_callback(cb: dict[str, Any]) -> None:
                     chat_id,
                     f"Как переименовать «{target_ws.name or 'Без имени'}»? Напиши новое название.",
                 )
+                return
+
+            if data.startswith("wspin:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None or not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец.", alert=True)
+                    return
+                _set_state(user, {"flow": "set_pin", "workspace_id": target_id})
+                await answer_callback(cb_id)
+                has = target_ws.pin_hash is not None
+                await send_message(
+                    chat_id,
+                    (
+                        f"🔒 <b>Код-пароль для сайта</b> — кошелёк «{target_ws.name or 'Без имени'}»\n\n"
+                        + ("Придумай новый код-пароль, 4–8 символов (цифры и буквы). Прежний перестанет работать, все открытые сессии сайта разлогинятся.\n\n"
+                           if has else
+                           "Придумай код-пароль, 4–8 символов (цифры и буквы). Без него никто на сайте не сможет открыть этот кошелёк, даже если узнал 6-значный код синхронизации.\n\n")
+                        + "Отправь его одним сообщением. Чтобы отменить — нажми «🏠 Главное меню» внизу."
+                    ),
+                )
+                return
+
+            if data.startswith("wspinoff:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None or not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец.", alert=True)
+                    return
+                await answer_callback(cb_id)
+                await send_message(
+                    chat_id,
+                    (
+                        f"Снять код-пароль с «<b>{target_ws.name or 'Без имени'}</b>»?\n"
+                        "После этого любой, кто знает 6-значный код синхронизации, сможет открыть кошелёк на сайте без пароля."
+                    ),
+                    reply_markup=_confirm_keyboard(f"confwspinoff:{target_id}"),
+                )
+                return
+
+            if data.startswith("confwspinoff:"):
+                target_id = data.split(":", 1)[1]
+                target_ws = session.get(Workspace, target_id)
+                if target_ws is None or not _is_owner(session, user, target_ws):
+                    await answer_callback(cb_id, "Только владелец.", alert=True)
+                    return
+                from .api import set_workspace_pin as _clear_pin
+
+                _clear_pin(session, target_ws, None)
+                session.flush()
+                await answer_callback(cb_id, "Код-пароль снят")
+                if message_id:
+                    try:
+                        await edit_message_text(chat_id, message_id, "❌ Код-пароль снят. Все активные сессии на сайте разлогинены.")
+                    except Exception:
+                        pass
+                await show_wallets(chat_id, user, session)
                 return
 
             if data.startswith("wsleave:"):

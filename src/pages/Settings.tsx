@@ -6,10 +6,12 @@ import {
   disconnect,
   getKnownWorkspaces,
   getSyncConfig,
+  PinRequiredError,
   pullState,
   refreshWorkspaceMeta,
   removeKnownWorkspace,
   switchWorkspace,
+  WrongPinError,
   type SyncConfig,
 } from "../lib/sync";
 
@@ -20,6 +22,9 @@ export function Settings({ onLoadSample }: { onLoadSample: () => void }) {
   const [syncCfg, setSyncCfg] = useState(getSyncConfig());
   const [wallets, setWallets] = useState<SyncConfig[]>(getKnownWorkspaces());
   const [code, setCode] = useState("");
+  const [pin, setPin] = useState("");
+  const [pinRequired, setPinRequired] = useState(false);
+  const [pinWsName, setPinWsName] = useState<string | null>(null);
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
@@ -37,7 +42,7 @@ export function Settings({ onLoadSample }: { onLoadSample: () => void }) {
     setSyncError(null);
     setSyncBusy(true);
     try {
-      await connect(code);
+      await connect(code, pinRequired ? pin : null);
       setSyncCfg(getSyncConfig());
       setWallets(getKnownWorkspaces());
       const remote = await pullState();
@@ -45,18 +50,30 @@ export function Settings({ onLoadSample }: { onLoadSample: () => void }) {
         importData({ ...data, ...remote });
       }
       setCode("");
+      setPin("");
+      setPinRequired(false);
+      setPinWsName(null);
       setShowAdd(false);
     } catch (err) {
-      setSyncError((err as Error).message);
+      if (err instanceof PinRequiredError) {
+        setPinRequired(true);
+        setPinWsName(err.workspaceName);
+        setSyncError("У этого кошелька стоит код-пароль. Введи его ниже.");
+      } else if (err instanceof WrongPinError) {
+        setSyncError("Неверный код-пароль. Попробуй ещё раз.");
+      } else {
+        setSyncError((err as Error).message);
+      }
     } finally {
       setSyncBusy(false);
     }
   }
 
-  function handleDisconnect() {
+  async function handleDisconnect() {
     if (!confirm("Отключить синхронизацию? Данные останутся в этом браузере.")) return;
-    disconnect();
+    await disconnect();
     setSyncCfg(null);
+    setWallets(getKnownWorkspaces());
   }
 
   async function handleRefresh() {
@@ -178,21 +195,60 @@ export function Settings({ onLoadSample }: { onLoadSample: () => void }) {
         )}
 
         {(showAdd || !syncCfg) && (
-          <div className="mt-3 flex flex-wrap items-end gap-2">
-            <div>
-              <label className="mb-1 block text-xs text-slate-500">Код из бота</label>
-              <input
-                className="input w-40"
-                placeholder="ABC123"
-                value={code}
-                maxLength={8}
-                onChange={(e) => setCode(e.target.value.toUpperCase())}
-                disabled={syncBusy}
-              />
+          <div className="mt-3 space-y-2">
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="flex-1 min-w-[9rem]">
+                <label className="mb-1 block text-xs text-slate-500">Код из бота</label>
+                <input
+                  className="input w-full"
+                  placeholder="ABC123"
+                  value={code}
+                  maxLength={8}
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  onChange={(e) => {
+                    const v = e.target.value.toUpperCase();
+                    setCode(v);
+                    if (pinRequired) {
+                      setPinRequired(false);
+                      setPin("");
+                      setPinWsName(null);
+                    }
+                  }}
+                  disabled={syncBusy}
+                />
+              </div>
+              {pinRequired && (
+                <div className="flex-1 min-w-[9rem]">
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Код-пароль{pinWsName ? ` для «${pinWsName}»` : ""}
+                  </label>
+                  <input
+                    className="input w-full"
+                    placeholder="••••"
+                    type="password"
+                    value={pin}
+                    maxLength={32}
+                    inputMode="text"
+                    autoComplete="off"
+                    onChange={(e) => setPin(e.target.value)}
+                    disabled={syncBusy}
+                  />
+                </div>
+              )}
+              <button
+                className="btn-primary"
+                onClick={handleConnect}
+                disabled={syncBusy || !code || (pinRequired && !pin)}
+              >
+                {syncBusy ? "Подключаю..." : "Подключить"}
+              </button>
             </div>
-            <button className="btn-primary" onClick={handleConnect} disabled={syncBusy || !code}>
-              {syncBusy ? "Подключаю..." : "Подключить"}
-            </button>
+            {pinRequired && (
+              <p className="text-xs text-slate-500">
+                Код-пароль задаёт владелец кошелька в боте: <b>«👛 Кошельки»</b> → <b>«🔒 Поставить код-пароль»</b>.
+              </p>
+            )}
           </div>
         )}
 

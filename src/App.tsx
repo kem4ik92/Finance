@@ -122,26 +122,27 @@ export default function App() {
 
       {/* Main */}
       <main className="flex-1 min-w-0">
-        <header className="sticky top-0 z-20 flex items-center gap-3 border-b border-slate-100 bg-white/80 px-4 py-3 backdrop-blur md:px-8">
+        <header className="sticky top-0 z-20 flex items-center gap-2 border-b border-slate-100 bg-white/90 px-3 py-2 backdrop-blur md:gap-3 md:px-8 md:py-3">
           <button
-            className="btn-ghost md:hidden"
+            className="btn-ghost !min-h-[40px] !px-3 md:hidden"
             onClick={() => setMobileNavOpen(true)}
             aria-label="Меню"
           >
             ☰
           </button>
-          <h1 className="text-lg font-semibold text-slate-800">{pageTitle}</h1>
+          <h1 className="truncate text-base font-semibold text-slate-800 md:text-lg">{pageTitle}</h1>
           <div className="ml-auto flex items-center gap-2">
             <button className="btn-secondary hidden md:inline-flex" onClick={loadSample}>
               Демо-данные
             </button>
             <button className="btn-primary" onClick={() => setAddOpen(true)}>
-              + Добавить
+              <span className="hidden sm:inline">+ Добавить</span>
+              <span className="sm:hidden">＋</span>
             </button>
           </div>
         </header>
 
-        <div className="mx-auto max-w-6xl px-4 py-6 md:px-8">
+        <div className="mx-auto max-w-6xl px-3 py-4 pb-24 md:px-8 md:py-6 md:pb-6">
           {page === "dashboard" && (
             <Dashboard onAddClick={() => setAddOpen(true)} onTestData={loadSample} />
           )}
@@ -155,6 +156,30 @@ export default function App() {
           {page === "settings" && <Settings onLoadSample={loadSample} />}
         </div>
       </main>
+
+      {/* Mobile bottom tab bar */}
+      <nav className="safe-bottom fixed inset-x-0 bottom-0 z-30 flex items-stretch border-t border-slate-200 bg-white/95 backdrop-blur md:hidden">
+        {(
+          [
+            { key: "dashboard", label: "Главная", icon: "🏠" },
+            { key: "transactions", label: "Операции", icon: "🧾" },
+            { key: "analytics", label: "Аналит.", icon: "📊" },
+            { key: "debts", label: "Долги", icon: "🏦" },
+            { key: "goals", label: "Цели", icon: "🎯" },
+          ] as { key: PageKey; label: string; icon: string }[]
+        ).map((n) => (
+          <button
+            key={n.key}
+            onClick={() => setPage(n.key)}
+            className={`flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[11px] font-medium ${
+              page === n.key ? "text-brand-700" : "text-slate-500"
+            }`}
+          >
+            <span className="text-lg leading-none">{n.icon}</span>
+            <span>{n.label}</span>
+          </button>
+        ))}
+      </nav>
 
       <Modal open={addOpen} onClose={() => setAddOpen(false)} title="Новая транзакция">
         <TransactionForm onDone={() => setAddOpen(false)} />

@@ -13,15 +13,28 @@
   }
   body {
     @apply bg-slate-50 text-slate-900 antialiased;
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Prevent iOS Safari auto-zoom on input focus (triggered when font-size <16px). */
+  @media (max-width: 640px) {
+    input,
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
+  }
+  /* Respect safe-area on iOS (notch / gesture bar). */
+  .safe-bottom {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
   }
 }
 
 @layer components {
   .card {
-    @apply bg-white rounded-2xl shadow-card border border-slate-100 p-5;
+    @apply bg-white rounded-2xl shadow-card border border-slate-100 p-4 sm:p-5;
   }
   .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex min-h-[40px] items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn-primary {
     @apply btn bg-brand-600 text-white hover:bg-brand-700;

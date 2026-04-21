@@ -14,6 +14,7 @@ _load_env_file()
 from .api import router as api_router  # noqa: E402
 from .bot import dispatch_update, set_webhook_sync  # noqa: E402
 from .db import init_db  # noqa: E402
+from .reminders import start_reminders_task  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -32,13 +33,15 @@ app.include_router(api_router)
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     init_db()
     base = os.environ.get("PUBLIC_BASE_URL")
     if base and os.environ.get("TELEGRAM_BOT_TOKEN"):
         set_webhook_sync(base)
     else:
         log.warning("PUBLIC_BASE_URL or TELEGRAM_BOT_TOKEN missing; skipping webhook setup")
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        start_reminders_task()
 
 
 @app.get("/healthz")

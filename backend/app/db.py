@@ -56,6 +56,10 @@ class Workspace(Base):
     # Legacy per-workspace FSM state. Kept for backward compatibility; new code
     # stores conversational state on the User.
     pending_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Optional PIN that the web app must present to access this workspace.
+    # Stored as sha256(salt + pin). If NULL, workspace is unprotected.
+    pin_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    pin_salt: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     accounts: Mapped[list["Account"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
     categories: Mapped[list["Category"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
@@ -96,6 +100,20 @@ class WorkspaceMember(Base):
 
     workspace: Mapped["Workspace"] = relationship(back_populates="members")
     user: Mapped["User"] = relationship(back_populates="memberships")
+
+
+class WorkspaceSession(Base):
+    """Access token issued to a web client after successful PIN auth.
+
+    For unprotected workspaces no session is required at all.
+    """
+
+    __tablename__ = "workspace_sessions"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_dt)
 
 
 class Account(Base):
@@ -176,6 +194,10 @@ def init_db() -> None:
         cols = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info(workspaces)").fetchall()}
         if "pending_state" not in cols:
             conn.exec_driver_sql("ALTER TABLE workspaces ADD COLUMN pending_state TEXT")
+        if "pin_hash" not in cols:
+            conn.exec_driver_sql("ALTER TABLE workspaces ADD COLUMN pin_hash VARCHAR(128)")
+        if "pin_salt" not in cols:
+            conn.exec_driver_sql("ALTER TABLE workspaces ADD COLUMN pin_salt VARCHAR(32)")
 
     # Backfill User + WorkspaceMember from legacy Workspace.telegram_id so the
     # multi-wallet / multi-user model works for pre-existing data.

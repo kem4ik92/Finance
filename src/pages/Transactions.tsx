@@ -146,9 +146,9 @@ export function Transactions() {
                           >
                             {formatMoney(sign * t.amount, { sign: sign !== 0 })}
                           </div>
-                          <div className="flex opacity-0 transition group-hover:opacity-100">
+                          <div className="flex opacity-100 transition md:opacity-0 md:group-hover:opacity-100">
                             <button
-                              className="btn-ghost !px-2 !py-1"
+                              className="btn-ghost !min-h-0 !px-2 !py-1"
                               onClick={() => setEditing(t)}
                               title="Редактировать"
                               aria-label="Редактировать"
@@ -156,7 +156,7 @@ export function Transactions() {
                               ✎
                             </button>
                             <button
-                              className="btn-ghost !px-2 !py-1 text-rose-500 hover:bg-rose-50"
+                              className="btn-ghost !min-h-0 !px-2 !py-1 text-rose-500 hover:bg-rose-50"
                               onClick={() => {
                                 if (confirm("Удалить операцию?")) deleteTransaction(t.id);
                               }}

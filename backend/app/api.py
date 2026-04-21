@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import secrets as _secrets
 import uuid
 from datetime import date as date_cls
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -16,6 +18,7 @@ from .db import (
     Goal,
     Transaction,
     Workspace,
+    WorkspaceSession,
     db_session,
     new_link_code,
     new_workspace_id,
@@ -39,6 +42,68 @@ def _load_ws(session: Session, workspace_id: str) -> Workspace:
     if ws is None:
         raise HTTPException(404, "workspace not found")
     return ws
+
+
+# ---------- PIN helpers & auth ----------
+
+def _hash_pin(pin: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}:{pin}".encode("utf-8")).hexdigest()
+
+
+def set_workspace_pin(session: Session, ws: Workspace, pin: Optional[str]) -> None:
+    """Set or clear the workspace PIN. Clearing invalidates all sessions."""
+    if pin is None or pin == "":
+        ws.pin_hash = None
+        ws.pin_salt = None
+    else:
+        salt = _secrets.token_hex(8)
+        ws.pin_salt = salt
+        ws.pin_hash = _hash_pin(pin, salt)
+    # Invalidate any existing web sessions whenever PIN changes.
+    session.query(WorkspaceSession).filter(
+        WorkspaceSession.workspace_id == ws.id
+    ).delete()
+
+
+def _issue_session(session: Session, workspace_id: str) -> str:
+    token = _secrets.token_urlsafe(32)
+    session.add(WorkspaceSession(token=token, workspace_id=workspace_id, created_at=now_dt()))
+    session.flush()
+    return token
+
+
+def _token_from_header(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip() or None
+    return authorization.strip() or None
+
+
+def require_ws_access(
+    workspace_id: str,
+    authorization: Optional[str] = Header(None),
+) -> None:
+    """FastAPI dependency: allow only if the workspace is unprotected OR the
+    caller presents a valid Bearer session token for this workspace.
+    """
+    with db_session() as session:
+        ws = _load_ws(session, workspace_id)
+        if ws.pin_hash is None:
+            return  # unprotected — backward-compatible public access by code
+        token = _token_from_header(authorization)
+        if not token:
+            raise HTTPException(401, "pin required")
+        row = (
+            session.query(WorkspaceSession)
+            .filter(
+                WorkspaceSession.token == token,
+                WorkspaceSession.workspace_id == workspace_id,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            raise HTTPException(401, "invalid session")
 
 
 # ---------- workspace management ----------
@@ -68,7 +133,12 @@ def resolve_code(code: str) -> dict[str, Any]:
         ws = session.query(Workspace).filter(Workspace.link_code == code.upper()).one_or_none()
         if ws is None:
             raise HTTPException(404, "code not found")
-        return {"workspaceId": ws.id, "linkCode": ws.link_code, "name": ws.name}
+        return {
+            "workspaceId": ws.id,
+            "linkCode": ws.link_code,
+            "name": ws.name,
+            "requiresPin": ws.pin_hash is not None,
+        }
 
 
 @router.get("/workspaces/{workspace_id}/meta")
@@ -77,11 +147,68 @@ def get_meta(workspace_id: str) -> dict[str, Any]:
         ws = session.get(Workspace, workspace_id)
         if ws is None:
             raise HTTPException(404, "workspace not found")
-        return {"workspaceId": ws.id, "linkCode": ws.link_code, "name": ws.name}
+        return {
+            "workspaceId": ws.id,
+            "linkCode": ws.link_code,
+            "name": ws.name,
+            "requiresPin": ws.pin_hash is not None,
+        }
+
+
+class AuthIn(BaseModel):
+    code: str
+    pin: Optional[str] = None
+
+
+@router.post("/workspaces/auth")
+def auth_workspace(payload: AuthIn) -> dict[str, Any]:
+    """Exchange (code, pin) for a web session token.
+
+    Returns 401 if workspace requires PIN and it is missing/wrong.
+    For unprotected workspaces, `pin` is ignored and a token is still issued
+    so clients can consistently send Authorization headers if they want to.
+    """
+    with db_session() as session:
+        ws = session.query(Workspace).filter(Workspace.link_code == payload.code.upper()).one_or_none()
+        if ws is None:
+            raise HTTPException(404, "code not found")
+        if ws.pin_hash is not None:
+            pin = (payload.pin or "").strip()
+            if not pin:
+                raise HTTPException(401, "pin required")
+            if _hash_pin(pin, ws.pin_salt or "") != ws.pin_hash:
+                raise HTTPException(401, "wrong pin")
+        token = _issue_session(session, ws.id)
+        return {
+            "workspaceId": ws.id,
+            "linkCode": ws.link_code,
+            "name": ws.name,
+            "requiresPin": ws.pin_hash is not None,
+            "token": token,
+        }
+
+
+@router.post("/workspaces/{workspace_id}/logout")
+def logout(
+    workspace_id: str,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, bool]:
+    token = _token_from_header(authorization)
+    if not token:
+        return {"ok": True}
+    with db_session() as session:
+        session.query(WorkspaceSession).filter(
+            WorkspaceSession.token == token,
+            WorkspaceSession.workspace_id == workspace_id,
+        ).delete()
+    return {"ok": True}
 
 
 @router.get("/workspaces/{workspace_id}/state")
-def get_state(workspace_id: str) -> dict[str, Any]:
+def get_state(
+    workspace_id: str,
+    _: None = Depends(require_ws_access),
+) -> dict[str, Any]:
     with db_session() as session:
         ws = _load_ws(session, workspace_id)
         return workspace_state(ws)
@@ -99,7 +226,9 @@ class AccountIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/accounts")
-def create_account(workspace_id: str, payload: AccountIn) -> dict[str, Any]:
+def create_account(
+    workspace_id: str, payload: AccountIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         _load_ws(session, workspace_id)
         a = Account(
@@ -118,7 +247,9 @@ def create_account(workspace_id: str, payload: AccountIn) -> dict[str, Any]:
 
 
 @router.patch("/workspaces/{workspace_id}/accounts/{account_id}")
-def update_account(workspace_id: str, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_account(
+    workspace_id: str, account_id: str, payload: dict[str, Any], _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         a = session.query(Account).filter(Account.id == account_id, Account.workspace_id == workspace_id).one_or_none()
         if a is None:
@@ -131,7 +262,9 @@ def update_account(workspace_id: str, account_id: str, payload: dict[str, Any]) 
 
 
 @router.delete("/workspaces/{workspace_id}/accounts/{account_id}")
-def delete_account(workspace_id: str, account_id: str) -> dict[str, bool]:
+def delete_account(
+    workspace_id: str, account_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, bool]:
     with db_session() as session:
         a = session.query(Account).filter(Account.id == account_id, Account.workspace_id == workspace_id).one_or_none()
         if a is None:
@@ -151,7 +284,9 @@ class CategoryIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/categories")
-def create_category(workspace_id: str, payload: CategoryIn) -> dict[str, Any]:
+def create_category(
+    workspace_id: str, payload: CategoryIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         _load_ws(session, workspace_id)
         c = Category(
@@ -168,7 +303,9 @@ def create_category(workspace_id: str, payload: CategoryIn) -> dict[str, Any]:
 
 
 @router.patch("/workspaces/{workspace_id}/categories/{category_id}")
-def update_category(workspace_id: str, category_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_category(
+    workspace_id: str, category_id: str, payload: dict[str, Any], _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         c = session.query(Category).filter(Category.id == category_id, Category.workspace_id == workspace_id).one_or_none()
         if c is None:
@@ -181,7 +318,9 @@ def update_category(workspace_id: str, category_id: str, payload: dict[str, Any]
 
 
 @router.delete("/workspaces/{workspace_id}/categories/{category_id}")
-def delete_category(workspace_id: str, category_id: str) -> dict[str, bool]:
+def delete_category(
+    workspace_id: str, category_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, bool]:
     with db_session() as session:
         c = session.query(Category).filter(Category.id == category_id, Category.workspace_id == workspace_id).one_or_none()
         if c is None:
@@ -204,7 +343,9 @@ class TransactionIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/transactions")
-def create_transaction(workspace_id: str, payload: TransactionIn) -> dict[str, Any]:
+def create_transaction(
+    workspace_id: str, payload: TransactionIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         _load_ws(session, workspace_id)
         t = Transaction(
@@ -225,7 +366,9 @@ def create_transaction(workspace_id: str, payload: TransactionIn) -> dict[str, A
 
 
 @router.patch("/workspaces/{workspace_id}/transactions/{tx_id}")
-def update_transaction(workspace_id: str, tx_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_transaction(
+    workspace_id: str, tx_id: str, payload: dict[str, Any], _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         t = session.query(Transaction).filter(Transaction.id == tx_id, Transaction.workspace_id == workspace_id).one_or_none()
         if t is None:
@@ -243,7 +386,9 @@ def update_transaction(workspace_id: str, tx_id: str, payload: dict[str, Any]) -
 
 
 @router.delete("/workspaces/{workspace_id}/transactions/{tx_id}")
-def delete_transaction(workspace_id: str, tx_id: str) -> dict[str, bool]:
+def delete_transaction(
+    workspace_id: str, tx_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, bool]:
     with db_session() as session:
         t = session.query(Transaction).filter(Transaction.id == tx_id, Transaction.workspace_id == workspace_id).one_or_none()
         if t is None:
@@ -267,7 +412,9 @@ class DebtIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/debts")
-def create_debt(workspace_id: str, payload: DebtIn) -> dict[str, Any]:
+def create_debt(
+    workspace_id: str, payload: DebtIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         _load_ws(session, workspace_id)
         d = Debt(
@@ -289,7 +436,9 @@ def create_debt(workspace_id: str, payload: DebtIn) -> dict[str, Any]:
 
 
 @router.patch("/workspaces/{workspace_id}/debts/{debt_id}")
-def update_debt(workspace_id: str, debt_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_debt(
+    workspace_id: str, debt_id: str, payload: dict[str, Any], _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         d = session.query(Debt).filter(Debt.id == debt_id, Debt.workspace_id == workspace_id).one_or_none()
         if d is None:
@@ -310,7 +459,9 @@ def update_debt(workspace_id: str, debt_id: str, payload: dict[str, Any]) -> dic
 
 
 @router.delete("/workspaces/{workspace_id}/debts/{debt_id}")
-def delete_debt(workspace_id: str, debt_id: str) -> dict[str, bool]:
+def delete_debt(
+    workspace_id: str, debt_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, bool]:
     with db_session() as session:
         d = session.query(Debt).filter(Debt.id == debt_id, Debt.workspace_id == workspace_id).one_or_none()
         if d is None:
@@ -326,7 +477,9 @@ class PayDebtIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/debts/{debt_id}/pay")
-def pay_debt(workspace_id: str, debt_id: str, payload: PayDebtIn) -> dict[str, Any]:
+def pay_debt(
+    workspace_id: str, debt_id: str, payload: PayDebtIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         d = session.query(Debt).filter(Debt.id == debt_id, Debt.workspace_id == workspace_id).one_or_none()
         if d is None:
@@ -368,7 +521,9 @@ class GoalIn(BaseModel):
 
 
 @router.post("/workspaces/{workspace_id}/goals")
-def create_goal(workspace_id: str, payload: GoalIn) -> dict[str, Any]:
+def create_goal(
+    workspace_id: str, payload: GoalIn, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         _load_ws(session, workspace_id)
         g = Goal(
@@ -388,7 +543,9 @@ def create_goal(workspace_id: str, payload: GoalIn) -> dict[str, Any]:
 
 
 @router.patch("/workspaces/{workspace_id}/goals/{goal_id}")
-def update_goal(workspace_id: str, goal_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_goal(
+    workspace_id: str, goal_id: str, payload: dict[str, Any], _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         g = session.query(Goal).filter(Goal.id == goal_id, Goal.workspace_id == workspace_id).one_or_none()
         if g is None:
@@ -407,7 +564,9 @@ def update_goal(workspace_id: str, goal_id: str, payload: dict[str, Any]) -> dic
 
 
 @router.delete("/workspaces/{workspace_id}/goals/{goal_id}")
-def delete_goal(workspace_id: str, goal_id: str) -> dict[str, bool]:
+def delete_goal(
+    workspace_id: str, goal_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, bool]:
     with db_session() as session:
         g = session.query(Goal).filter(Goal.id == goal_id, Goal.workspace_id == workspace_id).one_or_none()
         if g is None:
@@ -419,7 +578,9 @@ def delete_goal(workspace_id: str, goal_id: str) -> dict[str, bool]:
 # ---------- advice ----------
 
 @router.get("/workspaces/{workspace_id}/advice")
-def get_advice(workspace_id: str) -> dict[str, Any]:
+def get_advice(
+    workspace_id: str, _: None = Depends(require_ws_access)
+) -> dict[str, Any]:
     with db_session() as session:
         ws = _load_ws(session, workspace_id)
         adv = compute_advice(

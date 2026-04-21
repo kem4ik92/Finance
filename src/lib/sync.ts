@@ -16,6 +16,26 @@ export interface SyncConfig {
   linkCode: string;
   connectedAt: string;
   name?: string | null;
+  token?: string | null;
+  requiresPin?: boolean;
+}
+
+export class PinRequiredError extends Error {
+  readonly linkCode: string;
+  readonly workspaceName: string | null;
+  constructor(linkCode: string, workspaceName: string | null) {
+    super("PIN required");
+    this.name = "PinRequiredError";
+    this.linkCode = linkCode;
+    this.workspaceName = workspaceName;
+  }
+}
+
+export class WrongPinError extends Error {
+  constructor() {
+    super("Wrong PIN");
+    this.name = "WrongPinError";
+  }
 }
 
 const DEFAULT_API_BASE = "https://manat-backend-txrnbhuq.fly.dev";
@@ -108,6 +128,9 @@ async function api<T>(
     "content-type": "application/json",
     ...(init?.headers ?? {}),
   };
+  if (cfg?.token) {
+    headers["Authorization"] = `Bearer ${cfg.token}`;
+  }
   const opts: RequestInit = {
     method: init?.method ?? "GET",
     headers,
@@ -116,6 +139,24 @@ async function api<T>(
     opts.body = typeof init.body === "string" ? init.body : JSON.stringify(init.body);
   }
   const res = await fetch(base + path, opts);
+  if (res.status === 401) {
+    // Token expired or PIN rotated. Invalidate active cfg so UI can ask again.
+    if (cfg) {
+      const list = getKnownWorkspaces();
+      const updated = list.map((w) =>
+        w.workspaceId === cfg.workspaceId ? { ...w, token: null, requiresPin: true } : w,
+      );
+      saveKnownWorkspaces(updated);
+      const cur = getSyncConfig();
+      if (cur?.workspaceId === cfg.workspaceId) {
+        localStorage.setItem(
+          SYNC_KEY,
+          JSON.stringify({ ...cur, token: null, requiresPin: true }),
+        );
+      }
+    }
+    throw new PinRequiredError(cfg?.linkCode ?? "", cfg?.name ?? null);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${path}: ${text.slice(0, 200)}`);
@@ -135,13 +176,58 @@ interface WorkspaceState {
 export async function resolveCode(
   code: string,
   apiBase: string = DEFAULT_API_BASE,
-): Promise<{ workspaceId: string; linkCode: string; name?: string | null }> {
+): Promise<{
+  workspaceId: string;
+  linkCode: string;
+  name?: string | null;
+  requiresPin?: boolean;
+}> {
   const clean = code.trim().toUpperCase();
   if (!clean) throw new Error("Введите код");
   const res = await fetch(`${apiBase}/api/workspaces/by-code/${clean}`);
   if (res.status === 404) throw new Error("Код не найден. Проверь /link в боте.");
   if (!res.ok) throw new Error(`Ошибка ${res.status}`);
-  return (await res.json()) as { workspaceId: string; linkCode: string; name?: string | null };
+  return (await res.json()) as {
+    workspaceId: string;
+    linkCode: string;
+    name?: string | null;
+    requiresPin?: boolean;
+  };
+}
+
+export async function authenticate(
+  code: string,
+  pin: string | null,
+  apiBase: string = DEFAULT_API_BASE,
+): Promise<{
+  workspaceId: string;
+  linkCode: string;
+  name: string | null;
+  requiresPin: boolean;
+  token: string;
+}> {
+  const clean = code.trim().toUpperCase();
+  const res = await fetch(`${apiBase}/api/workspaces/auth`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code: clean, pin }),
+  });
+  if (res.status === 404) throw new Error("Код не найден. Проверь в боте «🔗 Код».");
+  if (res.status === 401) {
+    const info = await resolveCode(clean, apiBase).catch(() => null);
+    if (!pin) {
+      throw new PinRequiredError(clean, info?.name ?? null);
+    }
+    throw new WrongPinError();
+  }
+  if (!res.ok) throw new Error(`Ошибка ${res.status}`);
+  return (await res.json()) as {
+    workspaceId: string;
+    linkCode: string;
+    name: string | null;
+    requiresPin: boolean;
+    token: string;
+  };
 }
 
 export async function pullState(): Promise<Partial<AppData> | null> {
@@ -161,14 +247,17 @@ export async function pullState(): Promise<Partial<AppData> | null> {
 
 export async function connect(
   code: string,
+  pin: string | null = null,
   apiBase: string = DEFAULT_API_BASE,
 ): Promise<void> {
-  const { workspaceId, linkCode, name } = await resolveCode(code, apiBase);
+  const auth = await authenticate(code, pin, apiBase);
   setSyncConfig({
     apiBase,
-    workspaceId,
-    linkCode,
-    name: name ?? null,
+    workspaceId: auth.workspaceId,
+    linkCode: auth.linkCode,
+    name: auth.name ?? null,
+    token: auth.token,
+    requiresPin: auth.requiresPin,
     connectedAt: new Date().toISOString(),
   });
 }
@@ -179,11 +268,16 @@ export async function refreshWorkspaceMeta(workspaceId: string): Promise<void> {
     if (!cfg) return;
     const res = await fetch(`${cfg.apiBase}/api/workspaces/${workspaceId}/meta`);
     if (!res.ok) return;
-    const meta = (await res.json()) as { name?: string | null; linkCode?: string };
+    const meta = (await res.json()) as {
+      name?: string | null;
+      linkCode?: string;
+      requiresPin?: boolean;
+    };
     upsertKnownWorkspace({
       ...cfg,
       name: meta.name ?? null,
       linkCode: meta.linkCode ?? cfg.linkCode,
+      requiresPin: meta.requiresPin ?? cfg.requiresPin,
     });
     const cur = getSyncConfig();
     if (cur?.workspaceId === workspaceId) {
@@ -191,6 +285,7 @@ export async function refreshWorkspaceMeta(workspaceId: string): Promise<void> {
         ...cur,
         name: meta.name ?? null,
         linkCode: meta.linkCode ?? cur.linkCode,
+        requiresPin: meta.requiresPin ?? cur.requiresPin,
       });
     }
   } catch {
@@ -198,7 +293,18 @@ export async function refreshWorkspaceMeta(workspaceId: string): Promise<void> {
   }
 }
 
-export function disconnect() {
+export async function disconnect(): Promise<void> {
+  const cfg = getSyncConfig();
+  if (cfg?.token) {
+    try {
+      await fetch(`${cfg.apiBase}/api/workspaces/${cfg.workspaceId}/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cfg.token}` },
+      });
+    } catch {
+      // ignore
+    }
+  }
   clearSyncConfig();
 }
 
